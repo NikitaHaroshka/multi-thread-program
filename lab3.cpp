@@ -1,160 +1,145 @@
 #include <windows.h>
 #include <iostream>
 #include <vector>
-
 using namespace std;
 
-// Глобальные переменные
 volatile int* A = nullptr;
-int n;
+int arraySize, threadToCloseInThread;
+HANDLE Ready, ReportOfClose, Again;
+HANDLE* CantWork, Threads;
+HANDLE StopWork;
+volatile int countOfCant = 0; //Переменная счетчик потоков, которые подали сигнал о желании завершить
+CRITICAL_SECTION cs;  // Критическая секция
 
-// Указатели на события для управления потоками
-HANDLE* MustWork;
-HANDLE* CantWork;
-HANDLE StartAll;
-
-// Структура для передачи параметров потоку
-struct MarkerParams {
-    int index;
-};
-
-// Функция, выполняемая потоками marker
 DWORD WINAPI marker(LPVOID param) {
-    MarkerParams* params = (MarkerParams*)param;
-    int index = params->index;
+    WaitForSingleObject(Ready, INFINITE);
+    int index = (int)param;
     int count = 0;
+    srand(index + 1);
+    int funny = 5;
 
-    // Инициализация генерации случайных чисел
-    srand(index);
-
-    // Ожидание сигнала на начало работы
-    WaitForSingleObject(StartAll, INFINITE);
-
-    // Основной цикл работы потока
     while (true) {
-        // Проверяем, был ли подан сигнал на остановку
-        if (WaitForSingleObject(MustWork[index], 0) == WAIT_OBJECT_0) {
-            // Если получен сигнал на завершение, обнуляем помеченные элементы
-            for (int j = 0; j < n; j++) {
-                if (A[j] == index + 1) {
-                    A[j] = 0; // Обнуляем помеченные элементы
-                }
-            }
-            return 0; // Завершаем поток
-        }
+        int randNumber = rand() % arraySize;
+        EnterCriticalSection(&cs);
 
-        // Генерация случайного индекса
-        int randomIndex = rand() % n;
-
-        // Проверка элемента массива
-        if (A[randomIndex] == 0) {
-            Sleep(5); // Задержка 5 мс
-            A[randomIndex] = index + 1; // Запись номера потока
+        if (A[randNumber] == 0) {
+            Sleep(5);
+            A[randNumber] = index + 1;
             count++;
-            Sleep(5); // Задержка 5 мс
+            Sleep(5);
+            LeaveCriticalSection(&cs);
+
         }
         else {
-            // Если элемент занят, сигнализируем main и приостанавливаем работу
-            cout << "Thread " << index << " cannot mark index " << randomIndex << " after marking " << count << " elements." << endl;
-            SetEvent(CantWork[index]); // Устанавливаем событие для main
+            printf("Thread number %d marked %d elements and stopped on %d.\n", index+1,count,randNumber+1);
+            count = 0;
+            LeaveCriticalSection(&cs);
+            SetEvent(CantWork[index]);
+            WaitForSingleObject(StopWork, INFINITE);
 
-            // Ожидаем сигнала на продолжение работы
-            WaitForSingleObject(MustWork[index], INFINITE);
+            if (threadToCloseInThread == index + 1) {
+                for (int i = 0; i < arraySize; i++) {
+                    if (A[i] == index + 1) {
+                        A[i] = 0;
+                    }
+                }
+                ResetEvent(StopWork);
+                goto finish;
+            }
+            else {
+                ResetEvent(CantWork[index]);
+                WaitForSingleObject(Again, INFINITE);
+            }
         }
+        funny += 20;
     }
-
+finish:
     return 0;
 }
 
 int main() {
+    InitializeCriticalSection(&cs);  // Инициализация критической секции
     cout << "Enter array size: ";
-    cin >> n;
-
-    // Выделение памяти под массив
-    A = new int[n];
-    for (int i = 0; i < n; i++) {
-        A[i] = 0; // Инициализация массива нулями
+    cin >> arraySize;
+    A = new int[arraySize];
+    for (int i = 0; i < arraySize; i++) {
+        A[i] = 0;
     }
 
     int numOfThreads;
     cout << "Enter number of threads: ";
     cin >> numOfThreads;
 
-    // Создание массивов событий
-    MustWork = new HANDLE[numOfThreads];
+    HANDLE* Threads = new HANDLE[numOfThreads];
     CantWork = new HANDLE[numOfThreads];
-    HANDLE* threads = new HANDLE[numOfThreads];
-    MarkerParams* params = new MarkerParams[numOfThreads];
+    Again = CreateEvent(NULL, TRUE, FALSE, NULL);
+    ReportOfClose = CreateEvent(NULL, TRUE, FALSE, NULL);
+    Ready = CreateEvent(NULL, TRUE, FALSE, NULL);
+    StopWork = CreateEvent(NULL, TRUE, FALSE, NULL);  // Событие для остановки потоков
 
-    StartAll = CreateEvent(NULL, TRUE, FALSE, NULL); // Событие для начала работы
-
-    // Создание потоков
+    int* threadToEnd = new int[numOfThreads];  // Номера завершенных потоков
     for (int i = 0; i < numOfThreads; i++) {
-        MustWork[i] = CreateEvent(NULL, TRUE, FALSE, NULL);
-        CantWork[i] = CreateEvent(NULL, TRUE, FALSE, NULL);
-        params[i].index = i;
-        threads[i] = CreateThread(NULL, 0, marker, &params[i], 0, NULL);
+        threadToEnd[i] = 0;
     }
 
-    // Даем сигнал на начало работы всем потокам
-    SetEvent(StartAll);
-
-    // Основной цикл
-    int stoppedThreads = 0;
-    while (stoppedThreads < numOfThreads) {
-        bool allCantWork = true;
-        for (int i = 0; i < numOfThreads; i++) {
-            if (WaitForSingleObject(CantWork[i], 0) == WAIT_TIMEOUT) {
-                allCantWork = false; // Если хотя бы один поток может продолжить
-                break;
-            }
-        }
-
-        if (allCantWork) {
-            // Вывод содержимого массива
-            cout << "Array content: ";
-            for (int i = 0; i < n; i++) {
-                cout << A[i] << " ";
-            }
-            cout << endl;
-
-            // Запрос на завершение потока
-            int threadToStop;
-            cout << "Enter thread number to stop (0 to " << numOfThreads - 1 << "): ";
-            cin >> threadToStop;
-
-            // Подать сигнал на остановку
-            SetEvent(MustWork[threadToStop]);
-            WaitForSingleObject(threads[threadToStop], INFINITE); // Ожидание завершения потока
-            stoppedThreads++; // Увеличиваем количество завершенных потоков
-
-            // Вывод содержимого массива после остановки
-            cout << "Array content after stopping thread: ";
-            for (int i = 0; i < n; i++) {
-                cout << A[i] << " ";
-            }
-            cout << endl;
-
-            // Сигнализируем оставшимся потокам продолжить работу
-            for (int i = 0; i < numOfThreads; i++) {
-                ResetEvent(CantWork[i]);
-                SetEvent(MustWork[i]);
-            }
-        }
+    for (int i = 0; i < numOfThreads; i++) {
+        Threads[i] = CreateThread(NULL, 0, marker, (void*)(i), 0, NULL);
+        CantWork[i] = CreateEvent(NULL, TRUE, FALSE, NULL);  // Событие, которое подает поток
     }
 
-    // Закрытие потоков и освобождение ресурсов
+    SetEvent(Ready);
+
+    int workingThreads = numOfThreads;
+    int countOfFinished = 0;
+
+    while (countOfCant < numOfThreads) {
+        WaitForMultipleObjects(workingThreads, CantWork, TRUE, INFINITE);
+
+        EnterCriticalSection(&cs);
+        cout << endl << "Array: ";
+        for (int i = 0; i < arraySize; i++) {
+            cout << A[i] << " ";
+        }
+        cout << endl << "Ended threads: ";
+        for (int i = 0; i < countOfFinished; i++) {
+            cout << threadToEnd[i] << " ";
+        }
+        if (countOfFinished == 0) cout << " NO.";
+        cout << endl << "Enter number of thread to end: ";
+
+        cin >> threadToEnd[countOfFinished];
+        LeaveCriticalSection(&cs);
+
+        threadToCloseInThread = threadToEnd[countOfFinished];
+        SetEvent(StopWork);
+
+        WaitForSingleObject(Threads[threadToCloseInThread - 1], INFINITE);
+        EnterCriticalSection(&cs);
+        cout << "Array: ";
+        for (int i = 0; i < arraySize; i++) {
+            cout << A[i] << " ";
+        }
+        cout << endl;
+        LeaveCriticalSection(&cs);
+
+        countOfCant++;
+        workingThreads--;
+        countOfFinished++;
+
+        PulseEvent(Again);
+    }
+
     for (int i = 0; i < numOfThreads; i++) {
-        CloseHandle(threads[i]);
         CloseHandle(CantWork[i]);
-        CloseHandle(MustWork[i]);
+        CloseHandle(Threads[i]);
     }
-    CloseHandle(StartAll);
+    CloseHandle(Again);
+    CloseHandle(ReportOfClose);
+    CloseHandle(Ready);
+    CloseHandle(StopWork);
+    DeleteCriticalSection(&cs);  // Удаление критической секции
     delete[] A;
-    delete[] threads;
-    delete[] params;
-    delete[] MustWork;
-    delete[] CantWork;
+    delete[] Threads;
 
     return 0;
 }
